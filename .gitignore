@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 日志 / 临时
+*.log
+
+# 气压记录
+logs/
