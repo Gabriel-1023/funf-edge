@@ -380,6 +380,7 @@ class App:
         self._actual_live = {}        # 当前实际输出，用于插值逼近
         self._live_job = None         # tick 定时器
         self._last_plot_len = -1      # 上次绘图时的采样数
+        self._ble_state = "idle"      # 当前蓝牙状态（scan/conn/on/...）
         self.last_output = None       # 触发前的三路设定快照
         self._last_guard_state = IDLE
         self.press_hist = []          # [(ts, value, source)]
@@ -464,10 +465,17 @@ class App:
         self.addr_var = tk.StringVar(value="")
         ttk.Entry(bar, textvariable=self.addr_var, width=30).pack(side="left")
         ttk.Button(bar, text="扫描", command=lambda: self.ble.post(self.ble.do_scan)).pack(side="left", padx=3)
-        ttk.Button(bar, text="连接", command=lambda: self.ble.post(
-            self.ble.do_connect, self.addr_var.get())).pack(side="left", padx=3)
-        ttk.Button(bar, text="断开", command=lambda: self.ble.post(
-            self.ble.do_disconnect)).pack(side="left", padx=3)
+        # 连接按钮初始禁用：没扫到设备时地址为空，点它只会白等
+        self.btn_connect = ttk.Button(bar, text="连接", command=self._do_connect)
+        self.btn_connect.pack(side="left", padx=3)
+        self.btn_connect.state(["disabled"])
+        self.btn_disconnect = ttk.Button(bar, text="断开",
+                                         command=lambda: self.ble.post(
+                                             self.ble.do_disconnect))
+        self.btn_disconnect.pack(side="left", padx=3)
+        self.btn_disconnect.state(["disabled"])
+        # 地址框被手动填写时也要解锁连接按钮
+        self.addr_var.trace_add("write", lambda *_a: self._sync_conn_buttons())
 
         self.sliders, self.modes = {}, {}
         for key, label, color in (("suck", "吮吸", COL_SUCK),
@@ -687,25 +695,29 @@ class App:
         ttk.Label(limit, textvariable=self.limit_hint,
                   style="Card.TLabel").pack(side="left", padx=(8, 0))
 
-        ttk.Label(card, text="模拟气压（无硬件自测）", style="Card.TLabel").pack(
-            anchor="w", pady=(8, 0))
-        self.sim_var = tk.DoubleVar(value=0.0)
-        self.sim_lbl = tk.StringVar(value=fmt_p(0.0))
-        simrow = ttk.Frame(card, style="Card.TFrame")
-        simrow.pack(fill="x")
-        sim = tk.Scale(simrow, from_=0.0, to=PRESS_PLOT_MAX * 2,
-                       resolution=0.1, orient="horizontal",
-                       variable=self.sim_var, showvalue=False, bg=BG2, fg=FG,
-                       troughcolor="#2b2b33", highlightthickness=0,
-                       sliderrelief="flat", activebackground=COL_PRESS,
-                       command=self._on_sim)
-        sim.pack(side="left", fill="x", expand=True)
-        ttk.Label(simrow, textvariable=self.sim_lbl, width=6,
-                  style="CardBig.TLabel").pack(side="left", padx=(6, 0))
+        # 模拟源：开关在上，勾选后才显示下面的滑杆 ——
+        # 不启用时没必要占着一行横条。
         self.sim_enable = tk.BooleanVar(value=False)
         ttk.Checkbutton(card, text="启用模拟源（覆盖真实灵猫数据）",
                         variable=self.sim_enable,
-                        command=self._on_sim_toggle).pack(anchor="w")
+                        command=self._on_sim_toggle).pack(anchor="w", pady=(8, 0))
+
+        self.sim_box = ttk.Frame(card, style="Card.TFrame")
+        # 初始不 pack：勾选后才显示
+        self.sim_var = tk.DoubleVar(value=0.0)
+        self.sim_lbl = tk.StringVar(value=fmt_p(0.0))
+        simrow = ttk.Frame(self.sim_box, style="Card.TFrame")
+        simrow.pack(fill="x")
+        self.sim_scale = tk.Scale(simrow, from_=0.0, to=PRESS_PLOT_MAX * 2,
+                                  resolution=0.1, orient="horizontal",
+                                  variable=self.sim_var, showvalue=False, bg=BG2,
+                                  fg=FG, troughcolor="#2b2b33",
+                                  highlightthickness=0, sliderrelief="flat",
+                                  activebackground=COL_PRESS,
+                                  command=self._on_sim)
+        self.sim_scale.pack(side="left", fill="x", expand=True)
+        ttk.Label(simrow, textvariable=self.sim_lbl, width=6,
+                  style="CardBig.TLabel").pack(side="left", padx=(6, 0))
 
     # ------------------------------------------------------------ 日志
     def _build_log(self, parent):
@@ -723,6 +735,36 @@ class App:
         self.txt.tag_config("ok", foreground=COL_PRESS)
 
     # ================================================================ 玩具动作
+    def _do_connect(self):
+        addr = self.addr_var.get().strip()
+        if not addr:
+            self.log("先扫描选择设备，或手动填入地址", "er")
+            return
+        self.ble.post(self.ble.do_connect, addr)
+
+    def _sync_conn_buttons(self, connected=None):
+        """按当前状态切换「连接 / 断开」的可用性。
+
+        规则：
+          - 地址为空 -> 连接禁用（没东西可连）
+          - 已连接   -> 连接禁用、断开可用
+          - 未连接且有地址 -> 连接可用、断开禁用
+        """
+        if connected is None:
+            connected = bool(self.ble.client and self.ble.client.is_connected)
+        has_addr = bool(self.addr_var.get().strip())
+        # 扫描中 / 连接中：不允许再点连接，避免重复发起
+        busy = self._ble_state in ("scan", "conn")
+
+        def _set(w, enabled):
+            try:
+                w.state(["!disabled"] if enabled else ["disabled"])
+            except Exception:
+                pass
+
+        _set(self.btn_connect, has_addr and not connected and not busy)
+        _set(self.btn_disconnect, connected or self._ble_state == "conn")
+
     def gv(self, k):
         try:
             return max(0, min(100, int(self.sliders[k].get())))
@@ -1049,7 +1091,13 @@ class App:
                             time.time(), "sim")
 
     def _on_sim_toggle(self):
-        """切换模拟源时清空历史，避免模拟数据残留在真实曲线里。"""
+        """切换模拟源：显示/隐藏滑杆，并清空历史避免数据串味。"""
+        if self.sim_enable.get():
+            # 勾选后才显示滑杆（pack 在复选框下方）
+            self.sim_box.pack(fill="x", pady=(4, 0))
+        else:
+            self.sim_box.pack_forget()
+
         src = "模拟" if self.sim_enable.get() else "真实灵猫"
         with self.csv_lock:
             n = len(self.press_hist)
@@ -1535,10 +1583,17 @@ class App:
             self.txt.see("end")
         elif kind == "found":
             self.addr_var.set(payload[0])
+            self._sync_conn_buttons(False)   # 扫到了：允许点连接
         elif kind == "state":
             self.ble_status.set({"idle": "蓝牙：未连接", "scan": "蓝牙：扫描中…",
                                  "conn": "蓝牙：连接中…", "on": "蓝牙：已连接",
                                  "disc": "蓝牙：已断开", "err": "蓝牙：错误"}[payload])
+            # 连接状态变化 -> 同步按钮可用性
+            self._ble_state = payload
+            if payload == "on":
+                self._sync_conn_buttons(True)
+            else:
+                self._sync_conn_buttons(False)
         elif kind == "trip":
             p, ts, snap = payload
             self.log("⚠ 气压 %.1f 越过阈值 %.1f —— 全部输出已停止"

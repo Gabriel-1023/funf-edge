@@ -561,6 +561,73 @@ def test_live_send():
     root.destroy()
 
 
+# ---------------------------------------------------------------- I 界面状态
+def test_ui_states():
+    """连接按钮按状态启用/禁用；模拟源横条按勾选显示。"""
+    print("\n[I] 界面状态联动")
+    import tkinter as tk
+    import funf_edge_gui as G
+
+    root = tk.Tk()
+    app = G.App(root)
+    root.update()
+
+    def conn_off():
+        return "disabled" in app.btn_connect.state()
+
+    def disc_off():
+        return "disabled" in app.btn_disconnect.state()
+
+    # 初始：无地址，连接必须禁用
+    check("无地址时连接禁用", conn_off())
+
+    # 填入地址后解锁
+    app.addr_var.set("AA:BB:CC:DD:EE:FF")
+    root.update()
+    check("有地址时连接可用", not conn_off())
+
+    # 扫描中：不允许点连接
+    app._handle_ui("state", "scan")
+    root.update()
+    check("扫描中连接禁用", conn_off())
+
+    # 连接中：连接禁用、断开可用
+    app._handle_ui("state", "conn")
+    root.update()
+    check("连接中连接禁用", conn_off())
+    check("连接中可断开", not disc_off())
+
+    # 已连接
+    app._handle_ui("state", "on")
+    root.update()
+    check("已连接时连接禁用", conn_off())
+    check("已连接时断开可用", not disc_off())
+
+    # 断开后恢复
+    app._handle_ui("state", "disc")
+    root.update()
+    check("断开后连接恢复可用", not conn_off())
+    check("断开后断开按钮禁用", disc_off())
+
+    # 清空地址 -> 再次禁用
+    app.addr_var.set("")
+    root.update()
+    check("清空地址后连接禁用", conn_off())
+
+    # 模拟源横条：默认不显示，勾选后显示
+    check("模拟源横条默认隐藏", not app.sim_box.winfo_manager())
+    app.sim_enable.set(True)
+    app._on_sim_toggle()
+    root.update()
+    check("勾选后显示横条", bool(app.sim_box.winfo_manager()))
+    app.sim_enable.set(False)
+    app._on_sim_toggle()
+    root.update()
+    check("取消勾选后隐藏横条", not app.sim_box.winfo_manager())
+
+    root.destroy()
+
+
 def main():
     test_proto()
     test_guard()
@@ -570,6 +637,7 @@ def main():
     test_max_trips()
     test_qr()
     test_live_send()
+    test_ui_states()
     print("\n" + ("全部通过" if not FAILED else "失败项: %s" % FAILED))
     return 0 if not FAILED else 1
 
