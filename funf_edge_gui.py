@@ -76,6 +76,10 @@ LIVE_STEP_MAX = 10
 # 普通下发（非实时）的帧间隔。固件需要一点喘息，太快会丢帧。
 FRAME_GAP_SEC = 0.12
 
+# UI 主循环间隔（毫秒）。150ms 足够刷新气压与状态，
+# 又不会让重绘占满主线程（点击响应优先）。
+UI_TICK_MS = 150
+
 # 中继默认监听 0.0.0.0，界面展示/二维码编码用本机局域网 IP ——
 # 手机上的 DG-LAB APP 必须能路由到这个地址，127.0.0.1 在手机上指向手机自己。
 LAN_IP = netutil.lan_ip()
@@ -100,45 +104,69 @@ def fmt_p(v):
 
 
 def _install_mac_fixes(root):
-    """macOS 上「点一下没反应、要点好几次」的修复（同 funf_gui.py）。"""
+    """修 macOS 上「按钮要点两下才响应」的问题。
+
+    两个独立原因，都必须处理：
+      1. 从终端启动的进程不是常规前台应用，窗口永远不是 key window，
+         第一次点击只用来激活窗口，被系统吞掉。
+      2. Tk 的 TKContentView 的 acceptsFirstMouse: 返回 NO，
+         非活动窗口上的首次点击被丢弃。
+
+    踩过的坑：
+      - `objc.class_addMethod` 这个名字不存在，正确是 `objc.classAddMethod`。
+        之前写错后被 except 静默吞掉，这段修复其实从未生效过。
+      - `view.class_()` 也不存在；objc 对象的真实类直接用 `type(view)`。
+    """
     if not HAVE_APPKIT:
         return
-    try:
-        app = NSApplication.sharedApplication()
-        app.setActivationPolicy_(0)
-        app.activateIgnoringOtherApps_(True)
-    except Exception as e:
-        print("activate skipped:", e)
-    try:
-        root.update_idletasks()
-        root.lift()
-        root.focus_force()
-    except Exception:
-        pass
+
+    def _activate():
+        try:
+            app = NSApplication.sharedApplication()
+            app.setActivationPolicy_(0)          # Regular：有 Dock 图标、可成为 key
+            app.activateIgnoringOtherApps_(True)
+        except Exception as e:
+            print("activate skipped:", e)
+        try:
+            root.update_idletasks()
+            root.deiconify()
+            root.lift()
+            root.focus_force()
+        except Exception:
+            pass
 
     def _patch_views():
+        """给 TKContentView 注入 acceptsFirstMouse: -> YES。"""
         try:
+            from AppKit import NSApplication
             for win in NSApplication.sharedApplication().windows():
-                for view in (win.contentView(), win.contentView().superview()):
+                for view in (win.contentView(),
+                             win.contentView().superview() if win.contentView() else None):
                     if view is None:
                         continue
-                    cls = view.class_() if hasattr(view, "class_") else type(view)
+                    cls = type(view)             # objc 类，不能用 .class_()
                     if getattr(cls, "_dsh_accepts", False):
                         continue
                     try:
                         def _accepts(self, event):
                             return True
-                        objc.class_addMethod(
+                        objc.classAddMethod(          # 注意大小写
                             cls, b"acceptsFirstMouse:",
-                            objc.selector(_accepts, signature=b"B@:@"), b"B@:@")
+                            objc.selector(_accepts, signature=b"B@:@"))
                         cls._dsh_accepts = True
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print("acceptsFirstMouse 注入失败:", e)
         except Exception as e:
             print("view patch skipped:", e)
 
-    root.after(200, _patch_views)
-    root.after(1200, _patch_views)
+    _activate()
+    # 分几个时间点重复注入：窗口可能晚于 Tk mainloop 才真正创建
+    for ms in (100, 400, 1000, 2000):
+        root.after(ms, _patch_views)
+    root.after(1200, _activate)
+    # 注意：不要用 root.bind("<Button-1>") 去做激活 —— 那会在点击「之中」
+    # 触发窗口激活，反而可能打断 Tk 的事件分发。激活应该在点击之前完成，
+    # 由上面的 _activate() 和 main() 里的延后激活负责。
 
 
 # ====================================================================== BLE
@@ -351,6 +379,7 @@ class App:
         self._target_live = {}        # 目标值 {key: (val, mode)}
         self._actual_live = {}        # 当前实际输出，用于插值逼近
         self._live_job = None         # tick 定时器
+        self._last_plot_len = -1      # 上次绘图时的采样数
         self.last_output = None       # 触发前的三路设定快照
         self._last_guard_state = IDLE
         self.press_hist = []          # [(ts, value, source)]
@@ -377,7 +406,6 @@ class App:
         r.geometry("1340x860")
         r.configure(bg=BG)
         r.minsize(1300, 820)
-        _install_mac_fixes(r)
 
         st = ttk.Style()
         st.theme_use("clam")
@@ -1034,6 +1062,7 @@ class App:
             # 回到真实源：等下一帧真实数据即可
             self.press_info.set("等待灵猫数据…")
         self._redraw_plot()
+
     def _toggle_csv(self):
         if self.csv_var.get():
             os.makedirs("logs", exist_ok=True)
@@ -1328,6 +1357,7 @@ class App:
         # ---- 曲线 ----
         with self.csv_lock:
             hist = list(self.press_hist[-300:])
+            self._last_plot_len = len(self.press_hist)
 
         if len(hist) >= 2:
             t0, t1 = hist[0][0], hist[-1][0]
@@ -1443,8 +1473,12 @@ class App:
             self._refresh_guard_ui()
         self._last_guard_state = self.guard.state
         self._refresh_pressure_display()
-        self._redraw_plot()
-        self.root.after(120, self._pump_ui)
+        # 图表只在有新采样或参数变化时重绘。每帧无条件重绘 12ms，
+        # 会吃掉主线程 10% 以上的时间，密集点击时容易丢事件。
+        if self.press_hist and len(self.press_hist) != self._last_plot_len:
+            self._last_plot_len = len(self.press_hist)
+            self._redraw_plot()
+        self.root.after(UI_TICK_MS, self._pump_ui)
 
     def _tick_guard(self):
         """兜底推进状态机：dwell / cooldown 到期不必等新采样。"""
@@ -1596,6 +1630,9 @@ class App:
 def main():
     root = tk.Tk()
     app = App(root)
+    # 窗口和所有控件都建好之后再做 mac 修复 ——
+    # 之前在 _build 开头调用，那时窗口还不存在，注入对象不对。
+    _install_mac_fixes(root)
 
     def on_close():
         try:
@@ -1609,6 +1646,26 @@ def main():
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
+
+    # 最后再激活一次：mainloop 即将接管，此时窗口已完全创建，
+    # activateIgnoringOtherApps_ 才会真正把窗口提为 key window。
+    def _final_activate():
+        try:
+            from AppKit import NSApplication
+            ns = NSApplication.sharedApplication()
+            ns.setActivationPolicy_(0)
+            ns.activateIgnoringOtherApps_(True)
+        except Exception:
+            pass
+        try:
+            root.deiconify()
+            root.lift()
+            root.focus_force()
+        except Exception:
+            pass
+
+    root.after(80, _final_activate)
+    root.after(600, _final_activate)
     root.mainloop()
 
 

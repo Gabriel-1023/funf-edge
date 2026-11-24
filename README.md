@@ -236,6 +236,20 @@ python3 tools/mock_dglab_app.py --tid <上面打印的配对ID> --port 9998
 
 **`slots.patch` 是增量帧。** 直接赋值会丢字段，必须逐字段合并。
 
+**macOS 按钮点击失灵有三个独立原因，都要修。**
+
+1. `objc.class_addMethod` 这个名字**不存在**（正确是 `objc.classAddMethod`）。
+   写错后被 `except` 静默吞掉，这段「修首次点击」的代码其实从未生效过。
+   同理 `view.class_()` 也不存在 —— objc 对象的真实类直接用 `type(view)`。
+2. 进程从终端启动时不是常规前台应用，窗口永远不是 key window。
+   需要在窗口**建完之后**调 `setActivationPolicy_(0)` + `activateIgnoringOtherApps_`，
+   过早调用（比如在 `_build` 开头）时窗口还不存在，注入对象是错的。
+3. 主循环每 120ms 无条件重绘图表要花 12ms，占掉主线程 10%+，
+   密集点击时容易丢事件。改成 150ms 一次、且只在采样数变化时重绘。
+
+另外不要用 `root.bind("<Button-1>")` 去做激活 —— 那会在点击「之中」
+触发窗口激活，反而可能打断 Tk 的事件分发。
+
 **实时下发绝不能排队历史值。** 这是手感问题的根因。早期每次变化都
 `post()` 一条指令，而 `do_send` 里每帧 `sleep(0.12)` —— 用户从 0 拖到 100
 再拖回 0 之后，设备还在以 120ms/格 的速度把刚才的轨迹重播一遍，听感就是
