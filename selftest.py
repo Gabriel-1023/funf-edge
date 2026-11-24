@@ -507,6 +507,57 @@ def test_live_send():
     check("快照记录已下发值", app.last_output and app.last_output["vib"][0] == 100,
           app.last_output)
 
+    # ---- 手感：快速来回拖动不该回放历史值 ----
+    import time as _t
+
+    class SlowFC:
+        """故意慢的 BLE（30ms/次），用来暴露「历史值回放」问题。"""
+        is_connected = True
+        def __init__(self):
+            self.writes = []
+            self.times = []
+        async def write_gatt_char(self, ch, data, response=True):
+            self.writes.append(data.hex())
+            self.times.append(_t.time())
+            import asyncio as _a
+            await _a.sleep(0.03)
+
+    slow = SlowFC()
+    app.ble.client = slow
+    slow.writes.clear()
+    slow.times.clear()
+
+    t0 = _t.time()
+    while _t.time() - t0 < 1.2:
+        ph = ((_t.time() - t0) * 2) % 1.0
+        v = int(ph * 100 if ph < 0.5 else (1 - ph) * 100)
+        app.sliders["vib"].set(v)
+        app._queue_live_send("vib")
+        root.update()
+        _t.sleep(0.016)
+    drag_end = _t.time()
+    for _ in range(40):
+        root.update()
+        _t.sleep(0.02)
+
+    tail = (_t.time() - drag_end) * 1000
+    check("松手后快速收尾（无回放）", slow.times and
+          (slow.times[-1] - drag_end) < 0.25,
+          "尾帧 %.0fms" % tail)
+    check("拖动过程中有连续输出", len(slow.writes) >= 8, len(slow.writes))
+
+    # ---- 插值：大跳变分步逼近，不一次写到位 ----
+    app._actual_live["vib"] = (0, 1)
+    app._target_live["vib"] = (100, 1)
+    seq = []
+    for _ in range(12):
+        app._live_tick()
+        seq.append(app._actual_live["vib"][0])
+        if seq[-1] == 100:
+            break
+    check("大跳变分步逼近（非一次到位）", len(seq) >= 3 and seq[-1] == 100, seq)
+    check("步进单调递增", all(b >= a for a, b in zip(seq, seq[1:])), seq)
+
     root.destroy()
 
 

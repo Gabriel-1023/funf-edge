@@ -67,9 +67,14 @@ PRESS_THRESHOLD_DEFAULT = 45.0
 # 电量轮询间隔（秒）。连接后立刻查一次，之后按这个间隔刷新。
 BATT_POLL_SEC = 30
 
-# 滑杆实时下发的节流间隔（毫秒）。
-# 120ms 约等于 8 次/秒：拖动时能连续看到中间值，又不会把 BLE 写队列刷爆。
-LIVE_SEND_MS = 120
+# ---- 滑杆实时下发 ----
+# tick 间隔：40ms ≈ 25 次/秒。比 120ms 明显顺滑，又不会压垮 BLE 写队列。
+LIVE_TICK_MS = 40
+# 每 tick 强度最多变化多少格。目标跳 40 时分 4~5 次追上，
+# 观感是连续过渡而不是一次跳到 40。
+LIVE_STEP_MAX = 10
+# 普通下发（非实时）的帧间隔。固件需要一点喘息，太快会丢帧。
+FRAME_GAP_SEC = 0.12
 
 # 中继默认监听 0.0.0.0，界面展示/二维码编码用本机局域网 IP ——
 # 手机上的 DG-LAB APP 必须能路由到这个地址，127.0.0.1 在手机上指向手机自己。
@@ -143,6 +148,9 @@ class BleWorker:
     def __init__(self, ui_q):
         self.ui = ui_q
         self.cmd_q = queue.Queue()
+        self._live_lock = threading.Lock()
+        self._pending_frames = None
+        self._live_posted = False
         self.loop = None
         self.client = None
         self.buf = []
@@ -151,6 +159,29 @@ class BleWorker:
 
     def post(self, fn, *a):
         self.cmd_q.put((fn, a))
+
+    def post_live(self, frames):
+        """投递实时帧：队列里若已有一条未执行的实时帧，直接替换成最新的。
+
+        拖拽只关心最新值。若每次都 put，主循环一旦慢下来就会积压一串
+        历史值，设备把它们逐个播完 —— 手感就是慢半拍地「咔咔」爬。
+        替换而非追加，保证任何时刻最多只有一条待发的实时帧。
+        """
+        with self._live_lock:
+            self._pending_frames = frames
+            if self._live_posted:
+                return
+            self._live_posted = True
+        self.cmd_q.put((self._drain_live, ()))
+
+    async def _drain_live(self):
+        """取出最新那批实时帧发出去（一次只发最新）。"""
+        with self._live_lock:
+            frames = self._pending_frames
+            self._pending_frames = None
+            self._live_posted = False
+        if frames:
+            await self.do_send_live(frames)
 
     def log(self, msg):
         self.ui.put(("log", msg))
@@ -242,6 +273,7 @@ class BleWorker:
         self.ui.put(("state", "idle"))
 
     async def do_send(self, frames, wait=0.3):
+        """普通下发：逐帧写，帧间留一点间隔（固件需要）。"""
         if not (self.client and self.client.is_connected):
             self.log("未连接，指令丢弃")
             return
@@ -251,8 +283,28 @@ class BleWorker:
             await self.client.write_gatt_char(
                 P.CH_WRITE, bytes.fromhex(f), response=True)
             self.log("-> %s" % f)
-            await asyncio.sleep(0.12)
+            await asyncio.sleep(FRAME_GAP_SEC)
         await asyncio.sleep(wait)
+
+    async def do_send_live(self, frames):
+        """实时下发：不排队、不 sleep，直接写。
+
+        拖拽时的值只关心「最新」，历史中间值没有回放价值 —— 排队反而会让
+        设备慢半拍地重播刚才的轨迹（用户感觉到的「咔咔咔」）。
+        所以这里连续写、只在必要时让出一次事件循环。
+        """
+        if not (self.client and self.client.is_connected):
+            return
+        if isinstance(frames, str):
+            frames = [frames]
+        for f in frames:
+            try:
+                await self.client.write_gatt_char(
+                    P.CH_WRITE, bytes.fromhex(f), response=True)
+            except Exception as e:
+                self.log("实时下发失败: %s" % e)
+                return
+        await asyncio.sleep(0)      # 让出控制权，但不引入延迟
 
     async def do_emergency_stop(self, repeats=3, cancel_lost=False):
         """边控触发时调用：取消失控（可选）+ 连发全停帧。"""
@@ -296,8 +348,9 @@ class App:
         self.relay_thread = None
 
         self._qr_img = None           # 二维码位图引用（防 GC）
-        self._pending_live = {}       # 待下发的滑杆变化 {key: (val, mode)}
-        self._live_job = None         # 节流定时器
+        self._target_live = {}        # 目标值 {key: (val, mode)}
+        self._actual_live = {}        # 当前实际输出，用于插值逼近
+        self._live_job = None         # tick 定时器
         self.last_output = None       # 触发前的三路设定快照
         self._last_guard_state = IDLE
         self.press_hist = []          # [(ts, value, source)]
@@ -662,51 +715,88 @@ class App:
         return False
 
     def _queue_live_send(self, key):
-        """滑杆/模式变化时排一次下发（节流）。
+        """滑杆/模式变化：只记录目标值，由发送循环负责平滑逼近。
 
-        拖动 0→100 会产生上百次回调，每次都写 BLE 会堵住队列、手感发滞。
-        做法：记录「待发送」，由 _flush_live 以固定间隔合并发送 ——
-        拖动过程中持续发中间值（用户要求看到 0→100 的过程），但不会刷爆。
+        关键设计：**不排队历史值**。
+        拖动 0→100 会产生上百个中间值，如果把每个都排进队列逐个发，
+        设备会以固定间隔把刚才的轨迹重播一遍 —— 手感就是「咔咔咔」地
+        慢半拍爬上去。正确做法是只保留「当前目标」，用插值让实际输出
+        快速而平滑地追上去。
         """
         if self._guard_blocks():
             return
-        self._pending_live[key] = (self.gv(key), self.gm(key))
+        self._target_live[key] = (self.gv(key), self.gm(key))
+        self._start_live_loop()
+
+    def _start_live_loop(self):
         if self._live_job is None:
-            self._live_job = self.root.after(LIVE_SEND_MS, self._flush_live)
+            self._live_job = self.root.after(LIVE_TICK_MS, self._live_tick)
 
-    def _flush_now(self, key):
-        """立刻下发某一通道的当前值（用于拖动结束的精确收尾）。"""
-        if self._guard_blocks():
-            return
-        self._pending_live[key] = (self.gv(key), self.gm(key))
-        if self._live_job is not None:
-            try:
-                self.root.after_cancel(self._live_job)
-            except Exception:
-                pass
-            self._live_job = None
-        self._flush_live()
+    def _live_tick(self):
+        """一个 tick：把「实际输出」朝「目标值」推进一步，变化了才下发。
 
-    def _flush_live(self):
-        """把这一拍内累积的变化合并成一条帧下发。"""
+        用固定 tick（LIVE_TICK_MS）+ 每步限幅（LIVE_STEP_MAX）实现插值：
+        目标跳变 40 时不会一次写 40，而是按步长分几次逼近，观感连续。
+        """
         self._live_job = None
-        if not self._pending_live:
-            return
-        pending, self._pending_live = self._pending_live, {}
-
-        # 记录刚下发的设定，边控恢复/冲刺时用它
-        self._record_output(pending)
 
         frames = []
-        for key, (val, mode) in pending.items():
+        for key, (tgt, tmode) in list(self._target_live.items()):
+            # 首次没有 actual 时从 0 起算 —— 否则默认等于目标值，
+            # 第一帧就判定「已到位」，什么都不发。
+            cur, cmode = self._actual_live.get(key, (0, tmode))
+            changed = False          # 每个通道独立判断，不能共用
+
+            if cur != tgt:
+                delta = tgt - cur
+                # 自适应步长：差得远时迈大步（跟得上手速），
+                # 接近目标时收小步（末段不跳变）。
+                if abs(delta) > LIVE_STEP_MAX * 3:
+                    step = abs(delta) // 2       # 大跳变：一半一半逼近
+                else:
+                    step = min(abs(delta), LIVE_STEP_MAX)
+                cur += step if delta > 0 else -step
+                changed = True
+            if cmode != tmode:
+                cmode = tmode
+                changed = True
+
+            if not changed:
+                continue
+
+            self._actual_live[key] = (cur, cmode)
             if key == "suck":
-                frames.append(P.f_suck(val, mode))
+                frames.append(P.f_suck(cur, cmode))
             elif key == "vib":
-                frames.append(P.f_vib(val, mode))
+                frames.append(P.f_vib(cur, cmode))
             elif key == "cur":
-                frames.append(P.f_cur(val, mode))
+                frames.append(P.f_cur(cur, cmode))
+
         if frames:
-            self.ble.post(self.ble.do_send, frames, 0.0)
+            self._record_output(dict(self._actual_live))
+            self.ble.post_live(frames)
+
+        # 还有没追上的目标就继续 tick
+        pending = any(self._actual_live.get(k) != v
+                      for k, v in self._target_live.items())
+        if pending:
+            self._live_job = self.root.after(LIVE_TICK_MS, self._live_tick)
+
+    def _flush_now(self, key):
+        """松手时：直接把目标当成实际值一次发到位，避免停在半路。"""
+        if self._guard_blocks():
+            return
+        tgt, tmode = self.gv(key), self.gm(key)
+        self._target_live[key] = (tgt, tmode)
+        self._actual_live[key] = (tgt, tmode)
+        if key == "suck":
+            f = P.f_suck(tgt, tmode)
+        elif key == "vib":
+            f = P.f_vib(tgt, tmode)
+        else:
+            f = P.f_cur(tgt, tmode)
+        self._record_output({k: v for k, v in self._actual_live.items()})
+        self.ble.post_live([f])
 
     def stop_all(self):
         for k in self.sliders:
