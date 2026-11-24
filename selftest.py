@@ -452,6 +452,64 @@ def test_qr():
     root.destroy()
 
 
+# ---------------------------------------------------------------- H 实时下发
+def test_live_send():
+    """滑杆实时下发：节流生效、端点精确、模式即时。"""
+    print("\n[H] 滑杆实时下发")
+    import tkinter as tk
+    import funf_edge_gui as G
+
+    class FC:
+        is_connected = True
+        def __init__(self):
+            self.writes = []
+        async def write_gatt_char(self, ch, data, response=True):
+            self.writes.append(data.hex())
+
+    root = tk.Tk()
+    app = G.App(root)
+    root.update()
+    fc = FC()
+    app.ble.client = fc
+
+    # 拖动 0->100 后松手。
+    # 注意：after() 定时器要靠 update() + 真实时间推进才会触发，
+    # 单纯连续 update() 不会让节流器跑起来 —— 必须夹 sleep。
+    import time as _t
+    fc.writes.clear()
+    for v in range(0, 101, 10):
+        app.sliders["vib"].set(v)
+        app._queue_live_send("vib")
+        root.update()
+        _t.sleep(0.03)          # > LIVE_SEND_MS/4，让节流器有机会触发
+        root.update()
+    app.sliders["vib"].set(100)
+    app._flush_now("vib")
+    for _ in range(10):
+        root.update()
+        _t.sleep(0.02)
+
+    vals = [int(f[14:16], 16) for f in fc.writes if f.startswith("01010002000111")]
+    check("拖动产生多帧", len(vals) >= 3, vals)
+    check("末值精确为 100", vals and vals[-1] == 100, vals)
+    check("中间值被节流合并（非逐点全发）", len(vals) < 11, len(vals))
+
+    # 模式变化即时下发（同样需要时间推进让节流器跑）
+    fc.writes.clear()
+    app.modes["vib"].set("4")
+    for _ in range(12):
+        root.update()
+        _t.sleep(0.03)
+    check("模式变化立即下发",
+          any("000211 04".replace(" ", "") in f for f in fc.writes), fc.writes)
+
+    # 快照记录的是真正发出去的值
+    check("快照记录已下发值", app.last_output and app.last_output["vib"][0] == 100,
+          app.last_output)
+
+    root.destroy()
+
+
 def main():
     test_proto()
     test_guard()
@@ -460,6 +518,7 @@ def main():
     test_plot_segments()
     test_max_trips()
     test_qr()
+    test_live_send()
     print("\n" + ("全部通过" if not FAILED else "失败项: %s" % FAILED))
     return 0 if not FAILED else 1
 

@@ -27,6 +27,7 @@ funf_edge_gui.py — FUNF / SOSEXY 吮吸玩具 + 灵猫(BMTR_1)气压边控台
       （中继与 WebSocket 用自带 wsproto.py，无需 websockets/aiohttp）
       qrcode 可选，装了就能显示配对二维码
 """
+import asyncio
 import csv
 import os
 import queue
@@ -62,6 +63,13 @@ except Exception:
 PRESS_NORMAL_MAX = 40.0     # 正常上限
 PRESS_PLOT_MAX = 50.0       # 图表默认上限
 PRESS_THRESHOLD_DEFAULT = 45.0
+
+# 电量轮询间隔（秒）。连接后立刻查一次，之后按这个间隔刷新。
+BATT_POLL_SEC = 30
+
+# 滑杆实时下发的节流间隔（毫秒）。
+# 120ms 约等于 8 次/秒：拖动时能连续看到中间值，又不会把 BLE 写队列刷爆。
+LIVE_SEND_MS = 120
 
 # 中继默认监听 0.0.0.0，界面展示/二维码编码用本机局域网 IP ——
 # 手机上的 DG-LAB APP 必须能路由到这个地址，127.0.0.1 在手机上指向手机自己。
@@ -148,14 +156,12 @@ class BleWorker:
         self.ui.put(("log", msg))
 
     def _run(self):
-        import asyncio
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self.loop.create_task(self._pump())
         self.loop.run_forever()
 
     async def _pump(self):
-        import asyncio
         while True:
             try:
                 fn, a = self.cmd_q.get_nowait()
@@ -202,14 +208,40 @@ class BleWorker:
         self.log("已连接 %s" % addr)
         self.ui.put(("state", "on"))
 
+        # 连上先查一次，再起 30 秒轮询；断开时由 do_disconnect 取消
+        self._start_battery_poll()
+
+    def _start_battery_poll(self):
+        """连接成功后自动查电量：立刻一次 + 每 30 秒一次。"""
+        self._stop_battery_poll()
+        self._batt_task = asyncio.ensure_future(self._battery_loop())
+
+    def _stop_battery_poll(self):
+        t = getattr(self, "_batt_task", None)
+        if t and not t.done():
+            t.cancel()
+        self._batt_task = None
+
+    async def _battery_loop(self):
+        while True:
+            if not (self.client and self.client.is_connected):
+                return
+            try:
+                await self.client.write_gatt_char(
+                    P.CH_WRITE, bytes.fromhex(P.QUERY_BATT), response=True)
+            except Exception as e:
+                self.log("查电量失败: %s" % e)
+                return
+            await asyncio.sleep(BATT_POLL_SEC)
+
     async def do_disconnect(self):
+        self._stop_battery_poll()
         if self.client and self.client.is_connected:
             await self.client.disconnect()
         self.log("已断开")
         self.ui.put(("state", "idle"))
 
     async def do_send(self, frames, wait=0.3):
-        import asyncio
         if not (self.client and self.client.is_connected):
             self.log("未连接，指令丢弃")
             return
@@ -224,7 +256,6 @@ class BleWorker:
 
     async def do_emergency_stop(self, repeats=3, cancel_lost=False):
         """边控触发时调用：取消失控（可选）+ 连发全停帧。"""
-        import asyncio
         if not (self.client and self.client.is_connected):
             self.log("边控触发，但蓝牙未连接 —— 无输出可停")
             return
@@ -265,6 +296,8 @@ class App:
         self.relay_thread = None
 
         self._qr_img = None           # 二维码位图引用（防 GC）
+        self._pending_live = {}       # 待下发的滑杆变化 {key: (val, mode)}
+        self._live_job = None         # 节流定时器
         self.last_output = None       # 触发前的三路设定快照
         self._last_guard_state = IDLE
         self.press_hist = []          # [(ts, value, source)]
@@ -288,9 +321,9 @@ class App:
     def _build(self):
         r = self.root
         r.title("FUNF 边控台 · 吮吸玩具 + 灵猫气压")
-        r.geometry("1520x930")
+        r.geometry("1340x860")
         r.configure(bg=BG)
-        r.minsize(1500, 900)
+        r.minsize(1300, 820)
         _install_mac_fixes(r)
 
         st = ttk.Style()
@@ -320,6 +353,13 @@ class App:
                                   bg=BG, fg=COL_PRESS,
                                   font=("Helvetica", 13, "bold"))
         self.guard_lbl.pack(side="left", padx=8)
+
+        # 电量：连接后自动查一次，之后每 30 秒刷新，不需要手动点
+        self.batt_var = tk.StringVar(value="电量 —")
+        self.batt_lbl = tk.Label(head, textvariable=self.batt_var, bg=BG,
+                                 fg=COL_PRESS,
+                                 font=("Helvetica", 13, "bold"))
+        self.batt_lbl.pack(side="left", padx=(18, 0))
 
         cols = ttk.Frame(r, padding=(12, 0, 12, 8))
         cols.pack(fill="both", expand=True)
@@ -358,31 +398,34 @@ class App:
             val = tk.IntVar(value=0)
             ttk.Label(f, textvariable=val, width=4,
                       style="Card.TLabel").pack(side="left")
+            # 拖动即下发：Scale 的 command 在拖动过程中持续触发，
+            # 由 _queue_live_send 做节流，避免把 BLE 队列刷爆
             sc = tk.Scale(f, from_=0, to=100, orient="horizontal", variable=val,
                           showvalue=False, bg=BG2, fg=FG, troughcolor="#2b2b33",
                           highlightthickness=0, sliderrelief="flat",
-                          activebackground=color, length=205)
+                          activebackground=color, length=205,
+                          command=lambda _v, k=key: self._queue_live_send(k))
+            # 松开鼠标时立即补发一次最终值 —— 节流可能把端点吞掉，
+            # 导致「拖到 100 但实际停在 98」
+            sc.bind("<ButtonRelease-1>",
+                    lambda _e, k=key: self._flush_now(k))
             sc.pack(side="left", padx=6)
             m = tk.StringVar(value="1")
             ttk.Combobox(f, width=3, state="readonly", values=["1", "2", "3", "4"],
                          textvariable=m).pack(side="left", padx=3)
+            # 模式变化也立即下发
+            m.trace_add("write",
+                        lambda *_a, k=key: self._queue_live_send(k))
             ttk.Label(f, text="模式", style="Card.TLabel").pack(side="left")
             self.sliders[key] = val
             self.modes[key] = m
 
         btns = ttk.Frame(card, style="Card.TFrame")
         btns.pack(fill="x", pady=(8, 2))
-        ttk.Button(btns, text="下发（强度+模式）",
-                   command=self.apply_combo).pack(side="left", padx=3)
-        ttk.Button(btns, text="仅下发强度",
-                   command=self.apply_strength).pack(side="left", padx=3)
         ttk.Button(btns, text="全部停止",
                    command=self.stop_all).pack(side="left", padx=3)
         ttk.Button(btns, text="取消失控",
                    command=lambda: self.ble.post(self.ble.do_cancel_lost)).pack(side="left", padx=3)
-        ttk.Button(btns, text="查电量",
-                   command=lambda: self.ble.post(
-                       self.ble.do_send, P.QUERY_BATT, 0.8)).pack(side="left", padx=3)
 
         self.breathe_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(btns, text="呼吸灯", variable=self.breathe_var,
@@ -403,14 +446,6 @@ class App:
         ttk.Button(lost, text="开始", command=self.lost_start).pack(side="left", padx=6)
         ttk.Button(lost, text="取消", command=self.lost_stop).pack(side="left")
 
-        raw = ttk.Frame(card, style="Card.TFrame")
-        raw.pack(fill="x", pady=(6, 0))
-        self.raw_var = tk.StringVar(value="0101000100051101")
-        ttk.Entry(raw, textvariable=self.raw_var, width=38).pack(side="left")
-        ttk.Button(raw, text="发原始帧", command=lambda: self.ble.post(
-            self.ble.do_send,
-            self.raw_var.get().strip().replace(" ", ""), 0.6)).pack(side="left", padx=6)
-
     # ------------------------------------------------------------ 传感器面板
     def _build_sensor(self, parent):
         card = ttk.Frame(parent, style="Card.TFrame", padding=10)
@@ -418,46 +453,52 @@ class App:
         ttk.Label(card, text="② 灵猫气压 (BMTR_1 · DG-LAB V4)",
                   style="H2.TLabel").pack(anchor="w")
 
-        # ---- 配对信息：只留一条链接 + 二维码 ----
-        # 中继地址本身不再单独展示 —— 用户真正要的是「带 tid 的完整地址」，
-        # 展示两个地址只会让人不知道该复制哪个。
+        # ---- 配对信息：一条链接 + 二维码，按钮紧贴输入框 ----
+        # 布局要点：右侧二维码 240px 高会把容器撑高。若左侧三行直接用 grid
+        # 放在同一容器里，Tk 会把多余高度平均分给各行 —— 表现为行间空出
+        # 一大片。解法：左侧三行装进一个子 frame 用 pack 紧密堆叠，
+        # 该 frame 以 sticky="nw" 贴左上角，自身高度按内容收缩。
         self.relay_var = tk.StringVar(value=DEFAULT_RELAY)   # 内部状态，不显示
         pair = ttk.Frame(card, style="Card.TFrame")
         pair.pack(fill="x", pady=(8, 4))
+        pair.columnconfigure(0, weight=1)
 
         left = ttk.Frame(pair, style="Card.TFrame")
-        left.pack(side="left", fill="x", expand=True)
+        left.grid(row=0, column=0, sticky="nw")
 
+        # 状态行：靠上
         self.pair_state = tk.StringVar(value="中继启动中…")
         ttk.Label(left, textvariable=self.pair_state,
-                  style="CardBig.TLabel").pack(anchor="w")
+                  style="CardBig.TLabel", anchor="w").pack(
+                      side="top", anchor="w", fill="x")
 
         # 完整配对地址（局域网 IP + tid），只读但可选中复制
         self.pair_url_var = tk.StringVar(value="")
         self.pair_entry = ttk.Entry(left, textvariable=self.pair_url_var,
-                                    state="readonly", width=34)
-        self.pair_entry.pack(anchor="w", fill="x", pady=(3, 0))
+                                    state="readonly", width=30)
+        self.pair_entry.pack(side="top", anchor="w", fill="x", pady=(4, 0))
         self.pair_entry.bind("<FocusIn>",
                              lambda e: self.pair_entry.selection_range(0, "end"))
 
+        # 中继控制：紧贴地址框下方
+        row = ttk.Frame(left, style="Card.TFrame")
+        row.pack(side="top", anchor="w", pady=(6, 0))
+        self.btn_relay = ttk.Button(row, text="启动中继", width=9,
+                                    command=self.toggle_relay)
+        self.btn_relay.pack(side="left", padx=(0, 4))
+        self.btn_conn = ttk.Button(row, text="重连", width=6,
+                                   command=self.reconnect_sensor)
+        self.btn_conn.pack(side="left", padx=(0, 4))
+        ttk.Button(row, text="断开", width=6,
+                   command=self.stop_sensor).pack(side="left", padx=(0, 4))
+        ttk.Button(row, text="↻", width=3,
+                   command=self.refresh_lan_addr).pack(side="left")
+
+        # 二维码：靠右上对齐
         self.qr_canvas = tk.Canvas(pair, width=self.QR_BOX,
                                    height=self.QR_BOX, bg=BG2,
                                    highlightthickness=0)
-        self.qr_canvas.pack(side="right", padx=(8, 0))
-
-        # 中继控制（不再有地址输入框）
-        row = ttk.Frame(card, style="Card.TFrame")
-        row.pack(fill="x", pady=(2, 4))
-        self.btn_relay = ttk.Button(row, text="启动中继", width=9,
-                                    command=self.toggle_relay)
-        self.btn_relay.pack(side="left", padx=(0, 3))
-        self.btn_conn = ttk.Button(row, text="重连", width=6,
-                                   command=self.reconnect_sensor)
-        self.btn_conn.pack(side="left", padx=3)
-        ttk.Button(row, text="断开", width=6,
-                   command=self.stop_sensor).pack(side="left", padx=3)
-        ttk.Button(row, text="↻", width=3,
-                   command=self.refresh_lan_addr).pack(side="left", padx=(2, 0))
+        self.qr_canvas.grid(row=0, column=1, sticky="ne", padx=(10, 0))
 
         # 气压显示
         disp = ttk.Frame(card, style="Card.TFrame")
@@ -620,21 +661,52 @@ class App:
             return True
         return False
 
-    def apply_combo(self):
-        if self._guard_blocks():
-            return
-        self._record_output()
-        frames = P.combo_frames(self.gv("suck"), self.gm("suck"),
-                                self.gv("vib"), self.gm("vib"),
-                                self.gv("cur"), self.gm("cur"))
-        self.ble.post(self.ble.do_send, frames, 0.3)
+    def _queue_live_send(self, key):
+        """滑杆/模式变化时排一次下发（节流）。
 
-    def apply_strength(self):
+        拖动 0→100 会产生上百次回调，每次都写 BLE 会堵住队列、手感发滞。
+        做法：记录「待发送」，由 _flush_live 以固定间隔合并发送 ——
+        拖动过程中持续发中间值（用户要求看到 0→100 的过程），但不会刷爆。
+        """
         if self._guard_blocks():
             return
-        self._record_output()
-        self.ble.post(self.ble.do_send,
-                      P.f_strength(self.gv("vib"), self.gv("cur"), self.gv("suck")), 0.3)
+        self._pending_live[key] = (self.gv(key), self.gm(key))
+        if self._live_job is None:
+            self._live_job = self.root.after(LIVE_SEND_MS, self._flush_live)
+
+    def _flush_now(self, key):
+        """立刻下发某一通道的当前值（用于拖动结束的精确收尾）。"""
+        if self._guard_blocks():
+            return
+        self._pending_live[key] = (self.gv(key), self.gm(key))
+        if self._live_job is not None:
+            try:
+                self.root.after_cancel(self._live_job)
+            except Exception:
+                pass
+            self._live_job = None
+        self._flush_live()
+
+    def _flush_live(self):
+        """把这一拍内累积的变化合并成一条帧下发。"""
+        self._live_job = None
+        if not self._pending_live:
+            return
+        pending, self._pending_live = self._pending_live, {}
+
+        # 记录刚下发的设定，边控恢复/冲刺时用它
+        self._record_output(pending)
+
+        frames = []
+        for key, (val, mode) in pending.items():
+            if key == "suck":
+                frames.append(P.f_suck(val, mode))
+            elif key == "vib":
+                frames.append(P.f_vib(val, mode))
+            elif key == "cur":
+                frames.append(P.f_cur(val, mode))
+        if frames:
+            self.ble.post(self.ble.do_send, frames, 0.0)
 
     def stop_all(self):
         for k in self.sliders:
@@ -756,16 +828,21 @@ class App:
             self.btn_arm.configure(text="③ 布防（开始边控）")
         self.trip_var.set("触发 %d 次" % self.guard.trip_count)
 
-    def _record_output(self):
+    def _record_output(self, pending=None):
         """记录「用户设定」的三路强度+模式。
 
         这是恢复/冲刺时用的**唯一可信来源**：在下发的那一刻记录，而不是
         等触发时去读滑杆 —— 触发时滑杆可能已被归零（异步投递），读到的
         就是全 0，冲刺会误判「没开过」。
+
+        pending 是节流批里刚下发的 {key: (val, mode)}，优先用它，
+        这样记录的就是「真正发出去的值」。
         """
-        self.last_output = {k: (self.gv(k), self.gm(k))
-                            for k in ("suck", "vib", "cur")}
-        return self.last_output
+        snap = {k: (self.gv(k), self.gm(k)) for k in ("suck", "vib", "cur")}
+        if pending:
+            snap.update(pending)
+        self.last_output = snap
+        return snap
 
     def _on_trip(self, pressure, ts):
         """气压越线：立刻停掉全部输出。"""
@@ -1325,6 +1402,7 @@ class App:
         if kind == "log":
             self.log(payload)
         elif kind == "rx":
+            self._pick_battery(payload)
             d = P.describe(payload)
             line = "  <- %s" % payload
             if d:
@@ -1383,6 +1461,28 @@ class App:
             self._update_pair()
         elif kind == "pair":
             self.pair_url_var.set(payload)
+
+    def _pick_battery(self, hexstr):
+        """从上报帧里取电量（attr 0x0005），有就更新顶栏。"""
+        try:
+            rep = P.parse(hexstr)
+        except Exception:
+            return
+        v = rep.get(P.ATTR_BATT)
+        if not v:
+            return
+        try:
+            pct = v[0]
+        except (IndexError, TypeError):
+            return
+        self.batt_var.set("电量 %d%%" % pct)
+        # 低电量变红提示
+        if pct <= 20:
+            self.batt_lbl.configure(fg=COL_WARN)
+        elif pct <= 40:
+            self.batt_lbl.configure(fg=COL_CUR)
+        else:
+            self.batt_lbl.configure(fg=COL_PRESS)
 
     def _update_pair(self):
         """配对区只展示一条完整地址（局域网 IP + tid）+ 二维码。"""
